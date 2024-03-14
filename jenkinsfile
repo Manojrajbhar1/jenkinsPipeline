@@ -1,0 +1,120 @@
+pipeline {
+    agent any
+    parameters {
+        string(name: 'WAR_PATH', defaultValue: '/home/user/code_web_app_test/java-crud-webapp/target/java-crud-webapp.war', description: 'Enter the path of the WAR file')
+       booleanParam(name: '192.168.122.2', defaultValue: false)
+        booleanParam(name: '192.168.122.3', defaultValue: false)
+        booleanParam(name: '192.168.122.4', defaultValue: false)
+        booleanParam(name: '192.168.122.1', defaultValue: false)
+        booleanParam(name: '192.168.122.247', defaultValue: false)
+        booleanParam(name: 'DEPLOY_ALL_SERVERS', defaultValue: false)
+
+    }
+    stages {
+        stage('Copy and Deploy Module') {
+            steps {
+                script {
+                    // Define the module name
+                    def module = 'TEACHER_DEPLOY'
+
+                    // Use the provided WAR file path
+                    def warFile = params.WAR_PATH
+                    def destinationUser = 'manoj'
+
+                    // Define the server to class directory mapping
+                    def serverToClassDir = [
+                        '192.168.122.2': '/home/manoj/tomcat_appvm/webapps/',
+                        '192.168.122.3': '/home/user/Dir1/webapps/',
+                        '192.168.122.4': '/home/user/Di2/webapps/',
+                        '192.168.122.1': '/home/manoj/webapps2/apache/webapps',
+                        '192.168.122.247': '/home/manoj/tomcat_appvm/webapps/'
+                    ]
+
+                    // Collect all selected servers
+                    def selectedServers = []
+                   if (params['192.168.122.2']) selectedServers << '192.168.122.2'
+                        if (params['192.168.122.3']) selectedServers << '192.168.122.3'
+                        if (params['192.168.122.4']) selectedServers << '192.168.122.4'
+                        if (params['192.168.122.1']) selectedServers << '192.168.122.1'
+                        if (params['192.168.122.247']) selectedServers << '192.168.122.247'
+                        
+                        if (params.DEPLOY_ALL_SERVERS) {
+                        selectedServers = serverToClassDir.keySet().toList()
+                        }
+
+                    if (selectedServers.isEmpty()) {
+                        error('No server selected')
+                    }
+
+                    // Copy the WAR file from the source server
+                    def deployCommand = "rsync -e 'ssh -i /var/jenkins_home/.ssh/id_rsa' -v user@192.168.122.1:${warFile} ${WORKSPACE}"
+                    sh "${deployCommand} || error 'Failed to copy file from source server'"
+
+                    // Correct the path to the WAR file in the Jenkins workspace
+                    def warFileName = warFile.tokenize('/').last()
+
+                    // Get current timestamp in the specified format
+                    def timestamp = sh(script: 'date +"%Y-%m-%d_%H-%M"', returnStdout: true).trim()
+
+                    // Create a new WAR file name with the timestamp
+                    //def newwarFileName = warFileName.replace('.war', "-${timestamp}.war")
+                     def newwarFileName = "${warFileName}-${timestamp}"
+                    // Nexus upload flag
+                    def nexusUploadDone = false
+
+                    // Check if Nexus upload is not done already
+                    if (!nexusUploadDone) {
+                        withCredentials([usernamePassword(credentialsId: 'nexusCredentials', passwordVariable: 'NEXUS_PASSWORD', usernameVariable: 'NEXUS_USERNAME')]) {
+                            def nexusUrl = "${NNEXUS_URL}/${module}/${newwarFileName}"
+                    sh "curl -v -u ${NEXUS_USERNAME}:${NEXUS_PASSWORD} --upload-file ${WORKSPACE}/${warFileName} ${nexusUrl}"
+            
+                     def nsUrl = "${NNEXUS_URL}/${module}/${newwarFileName}"
+                     //sh "curl -s -o ${WORKSPACE}/${warFileName} '${nsUrl}'"
+                    sh "curl -s -o -u ${NEXUS_USERNAME}:${NEXUS_PASSWORD} ${WORKSPACE}/${warFileName} '${nsUrl}'"
+
+
+
+                            nexusUploadDone = true
+                        }
+                    }
+
+                    // Only proceed with the following steps if Nexus upload is done
+                    if (nexusUploadDone) {
+                        // Deployment steps
+                        def deploymentFailed = false
+
+                        selectedServers.each { server ->
+                            try {
+                                def classDir = serverToClassDir[server]
+                                def deployCommandToServer = "rsync -e 'ssh -i /var/jenkins_home/.ssh/id_rsa' -v ${WORKSPACE}/${warFileName} ${destinationUser}@${server}:${classDir}"
+                                sh "${deployCommandToServer} || error 'Failed to deploy file to destination server'"
+                                echo "Deployment successful on server ${server}"
+                            } catch (Exception e) {
+                                echo "Deployment failed on server ${server}: ${e.message}"
+                                deploymentFailed = true
+                            }
+                        }
+
+                        // Print Tomcat status before checking if any deployment failed
+                        selectedServers.each { server ->
+                            try {
+                                // Command to start Tomcat9 service
+                            sh "ssh -i /var/jenkins_home/.ssh/id_rsa ${destinationUser}@${server} 'echo -e \"\\e[32mTomcat9 is starting.\\e[0m\" && sudo systemctl restart tomcat9 &>/dev/null && sleep 5'"
+                            // Command to check the status of Tomcat9 service
+                            sh "ssh -i /var/jenkins_home/.ssh/id_rsa ${destinationUser}@${server} 'sudo systemctl status tomcat9' | awk '/Active:/ {print \$2, \$9}'"
+                     
+                            } catch (Exception e) {
+                                echo "Failed to check the status of Tomcat9 service on server ${server}: ${e.message}"
+                            }
+                        }
+
+                        // Check if any deployment failed
+                        if (deploymentFailed) {
+                            error("One or more deployments failed. that's why build status showing failure.")
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
