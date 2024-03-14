@@ -1,0 +1,125 @@
+pipeline {
+    agent any
+    parameters {
+        booleanParam(name: '192.168.122.2', defaultValue: false)
+        booleanParam(name: '192.168.122.3', defaultValue: false)
+        booleanParam(name: '192.168.122.4', defaultValue: false)
+        booleanParam(name: '192.168.122.1', defaultValue: false)
+        booleanParam(name: '192.168.122.247', defaultValue: false)
+        booleanParam(name: 'DEPLOY_ALL_SERVERS', defaultValue: false)
+
+    }
+    stages {
+        stage('Rollback Module') {
+            steps {
+                script {
+                    // Define the module name
+                    def module = 'TEACHER_DEPLOY'
+                    def destinationUser = 'manoj'
+
+
+                    // Use withCredentials to securely access Nexus credentials
+                    withCredentials([usernamePassword(credentialsId: 'nexusCredentials', usernameVariable: 'NEXUS_USERNAME', passwordVariable: 'NEXUS_PASSWORD')]) {
+                        // Fetch available versions from Nexus
+                        def versionsUrl = "${NNEX_URL}service/rest/repository/browse/raw-repo/${module}/"
+
+                        echo "Fetching versions from: ${versionsUrl}"
+  
+                        def versionsCommand = "curl -f -u ${NEXUS_USERNAME}:${NEXUS_PASSWORD} ${versionsUrl} | grep -oP '<a href=\"[^\"]+\\.war-[^\"]+\">' | awk -F'/' '{print substr(\$NF, 1, length(\$NF)-2)}' | sort -t'_' -k2,2r -k3,3r -k4,4r"
+
+                        def versions = sh(script: versionsCommand, returnStdout: true).trim()
+
+                        if (versions.isEmpty()) {
+                            error "No versions found in Nexus repository for module: ${module}"
+                        } else {
+                            echo "Available Versions for Rollback: ${versions}"
+                        }
+
+                        // Select version for rollback
+                        def selectedVersion = input(
+                            id: 'userInput',
+                            message: 'Select the version to rollback:',
+                            parameters: [
+                                choice(
+                                    name: 'SELECTED_VERSION',
+                                    choices: versions.split('\n').collect { it.trim() },
+                                    description: 'Available Versions'
+                                )
+                            ]
+                        )
+                        env.SELECTED_VERSION = selectedVersion
+
+                        // Download selected version from Nexus
+                        def rollbackWarFileInWorkspace = "${WORKSPACE}/${selectedVersion.replaceAll(/\"$/, '')}"
+                        def nsUrl = "${NNEXUS_URL}/${module}/${selectedVersion}"
+                        
+                        
+                         def originalFileName = "${selectedVersion}"
+                         def modifiedFileName = originalFileName.replaceAll(/-\d{4}-\d{2}-\d{2}_\d{2}-\d{2}$/, '')
+
+                        nsUrl = nsUrl.replaceAll(/\"$/, '')
+                        echo "Modified URL: ${nsUrl}"
+                       def downloadStatus = sh(script: "curl -O -J -L -u ${NEXUS_USERNAME}:${NEXUS_PASSWORD} '${nsUrl}'", returnStatus: true)
+                        if (downloadStatus != 0) {
+                            error "Failed to download WAR file from Nexus. Exit code: ${downloadStatus}"
+                        }
+
+                        // Define the server to class directory mapping
+                        def serverToClassDir = [
+                            '192.168.122.2': '/home/manoj/tomcat_appvm/webapps/',
+                            '192.168.122.3': '/home/user/Dir1/webapps/',
+                            '192.168.122.4': '/home/user/Di2/webapps/',
+                            '192.168.122.1': '/home/manoj/webapps2/apache/webapps/',
+                            '192.168.122.247': '/home/manoj/tomcat_appvm/webapps/'
+                        ]
+
+                        // Collect all selected servers
+                        def selectedServers = []
+                        if (params['192.168.122.2']) selectedServers << '192.168.122.2'
+                        if (params['192.168.122.3']) selectedServers << '192.168.122.3'
+                        if (params['192.168.122.4']) selectedServers << '192.168.122.4'
+                        if (params['192.168.122.1']) selectedServers << '192.168.122.1'
+                        if (params['192.168.122.247']) selectedServers << '192.168.122.247'
+                        
+                        if (params.DEPLOY_ALL_SERVERS) {
+                        selectedServers = serverToClassDir.keySet().toList()
+                        }
+                        
+                        if (selectedServers.isEmpty()) {
+                            error('No server selected')
+                        }
+
+                        // Deployment steps
+                        def deploymentFailed = false
+                        selectedServers.each { server ->
+                            try {
+                                def classDir = serverToClassDir[server]
+                                def deployCommandToServer = "rsync -e 'ssh -i /var/jenkins_home/.ssh/id_rsa' -v ${rollbackWarFileInWorkspace} manoj@${server}:${classDir}${modifiedFileName}"
+                                sh "${deployCommandToServer} || error 'Failed to deploy file to destination server'"
+                                echo "Deployment successful on server ${server}"
+                            } catch (Exception e) {
+                                echo "Deployment failed on server ${server}: ${e.message}"
+                                deploymentFailed = true
+                            }
+                        }
+                        selectedServers.each { server ->
+                            try {
+                                // Command to start Tomcat9 service
+                                sh "ssh -i /var/jenkins_home/.ssh/id_rsa ${destinationUser}@${server} 'echo -e \"\\e[32mTomcat9 is starting.\\e[0m\" && sudo systemctl start tomcat9 &>/dev/null && sleep 5'"
+                                // Command to check the status of Tomcat9 service
+                                sh "ssh -i /var/jenkins_home/.ssh/id_rsa ${destinationUser}@${server} 'sudo systemctl status tomcat9' | awk '/Active:/ {print \$2, \$9}'"
+                            } catch (Exception e) {
+                                echo "Failed to check the status of Tomcat9 service on server ${server}: ${e.message}"
+                            }
+                        }
+
+                        // Check if any deployment failed
+                        if (deploymentFailed) {
+                            error("One or more deployments failed. that's why build status showing failure.")
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
